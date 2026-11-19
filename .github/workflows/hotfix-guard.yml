@@ -1,50 +1,174 @@
-name: Hotfix guard
+# Hotfix guard — keeps a promotion PR (staging → main) from merging while a
+# hotfix that is already on `main` has not reached `staging` yet.
+# Docs (SOT): RELEASE-AND-DEPLOY.md · Ticket: 868mvy99b
+#
+# Why it exists: on 2026-11-10 hotfix #1118 reached `main` at 08:36 and
+# promotion #1126 was merged at 08:38, before the merge-back #1128 brought the
+# hotfix to `staging`. `main` and `staging` then had two merge bases, and the
+# next promotion (#1140) conflicted on 11 files.
+#
+# The question it answers: does `main` hold a non-release commit that `staging`
+# does not? Release commits (`chore(release): …`) are excluded because they never
+# flow back to `staging` by design. Merge commits are excluded because a
+# promotion's own merge commit is on `main` only.
+#
+# It reports a **commit status** (`hotfix-on-staging`) rather than a job check.
+# The dangerous moment is a hotfix landing on `main` while a promotion PR is
+# already open; that fires `push: main`, and a job check from that run would
+# attach to the `main` commit, not to the promotion PR. A commit status can be
+# written on any SHA, so the run writes it on the promotion PR's head.
+#
+#   - PR into main whose head is not `staging` (a hotfix, a restore PR): success
+#     at once, so the status never holds those PRs up once it is required.
+#   - PR into main whose head is `staging`: check, write on the PR head.
+#   - push to main: find the open promotion PR (if any), check, write on its head.
+#     A merge-back landing on `staging` moves the promotion PR's head, which fires
+#     `pull_request: synchronize`, so the status turns green by itself.
+#
+# Rollout: this reports from the first run, but blocks nothing until
+# `hotfix-on-staging` is added to the "main protection" ruleset's required
+# checks. Add it only after this file is on `main`: `push: main` runs the copy
+# on `main`, and a required status that never arrives holds every PR.
+
+name: Hotfix Guard
+
 on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
   push:
     branches: [main]
+
 permissions:
   contents: read
   statuses: write
   pull-requests: read
+
+# One group per PR, one for pushes. Within a group only the newest pending run
+# survives, which is fine: it re-reads the branches. A shared group would let a
+# push run cancel a hotfix PR's pending run and leave that PR without a status.
 concurrency:
-  group: hotfix-guard
+  group: hotfix-guard-${{ github.event.pull_request.number || 'push-main' }}
   cancel-in-progress: false
+
 jobs:
   guard:
+    name: hotfix-on-staging
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Decide target and check
+      - name: Pick the commit to report on
+        id: target
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            if [ "$HEAD_REF" = "staging" ]; then
+              echo "mode=check" >> "$GITHUB_OUTPUT"
+            else
+              echo "mode=pass" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+          SHA=$(gh pr list --repo "$REPO" --base main --head staging --state open \
+            --json headRefOid --jq '.[0].headRefOid // empty')
+          if [ -z "$SHA" ]; then
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+            echo "No open promotion PR — nothing to report on."
+          else
+            echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+            echo "mode=check" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        if: steps.target.outputs.mode == 'check'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Look for hotfix commits missing from staging
+        id: check
+        if: steps.target.outputs.mode == 'check'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main staging
+          # grep exits 1 when every line is a release commit; that is the clean case.
+          git log --no-merges --format='%h %s' origin/staging..origin/main \
+            | { grep -v ' chore(release): ' || true; } > /tmp/missing.txt
+          COUNT=$(wc -l < /tmp/missing.txt | tr -d ' ')
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "staging has every hotfix that is on main."
+            exit 0
+          fi
+
+          # The merge-back PRs are opened by hotfix-staging-pr.yml with a
+          # `chore(hotfix): merge … into staging` title.
+          gh pr list --repo "$REPO" --base staging --state open --json number,title,url \
+            --jq '.[] | select(.title | startswith("chore(hotfix):")) | "- #\(.number) — \(.title) (\(.url))"' \
+            > /tmp/merge-backs.txt || : > /tmp/merge-backs.txt
+          {
+            echo "## ❌ ${COUNT} hotfix commit(s) on \`main\` are not on \`staging\`"
+            echo
+            echo "This promotion cannot merge until \`staging\` has them."
+            echo
+            echo '```'
+            cat /tmp/missing.txt
+            echo '```'
+            echo
+            if [ -s /tmp/merge-backs.txt ]; then
+              echo "### Merge the open merge-back PR(s) first, with **Merge** (an ordinary merge commit)"
+              echo
+              cat /tmp/merge-backs.txt
+            else
+              echo "### No merge-back PR is open"
+              echo
+              echo "If the merge-back was **squashed** into \`staging\`, the fix is there but these commits are not. Merge the hotfix branch's head into \`staging\` once more as an ordinary merge commit. It changes no files:"
+              echo
+              echo '```bash'
+              echo 'git fetch origin'
+              echo 'git switch -c chore/remerge-hotfix origin/staging'
+              echo 'git merge --no-ff <hotfix head commit>'
+              echo '```'
+              echo
+              echo "Open a PR into \`staging\` and merge it with **Merge**. See RELEASE-AND-DEPLOY.md → Troubleshooting."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/missing.txt
+
+      - name: Report hotfix-on-staging
+        # always(): a check that crashed must still report, or the PR waits on a
+        # status that never comes. It reports `error`, which blocks like `failure`.
+        if: always() && steps.target.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.target.outputs.sha }}
+          MODE: ${{ steps.target.outputs.mode }}
+          COUNT: ${{ steps.check.outputs.count }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          post() { gh api "repos/$REPO/statuses/$1" -f context=hotfix-on-staging -f state="$2" -f description="$3" -f target_url="$RUN_URL" >/dev/null; echo "status $2 on $1: $3"; }
-          if [ "$EVENT" = "pull_request" ] && [ "$HEAD_REF" != "staging" ]; then
-            post "$HEAD_SHA" success "not a promotion PR"; exit 0
-          fi
-          if [ "$EVENT" = "push" ]; then
-            TARGET=$(gh pr list --repo "$REPO" --base main --head staging --state open --json headRefOid --jq '.[0].headRefOid // empty')
-            [ -z "$TARGET" ] && { echo "no open promotion PR"; exit 0; }
+          if [ "$MODE" = "pass" ]; then
+            STATE=success; DESC="Not a promotion PR"
+          elif [ "$CHECK_OUTCOME" != "success" ]; then
+            STATE=error; DESC="The guard could not run; open the run for the log"
+          elif [ "${COUNT:-0}" -eq 0 ]; then
+            STATE=success; DESC="staging has every hotfix on main"
           else
-            TARGET="$HEAD_SHA"
+            STATE=failure; DESC="${COUNT} hotfix commit(s) on main are not on staging yet"
           fi
-          git fetch -q origin main staging
-          MISSING=$(git log --no-merges --format='%h %s' origin/staging..origin/main | grep -v ' chore(release): ' || true)
-          if [ -z "$MISSING" ]; then
-            post "$TARGET" success "staging has every hotfix on main"
-          else
-            N=$(printf '%s\n' "$MISSING" | wc -l | tr -d ' ')
-            { echo "## hotfix not on staging yet"; echo '```'; echo "$MISSING"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-            post "$TARGET" failure "$N hotfix commit(s) on main not on staging"
-          fi
+          gh api "repos/${REPO}/statuses/${SHA}" \
+            -f context=hotfix-on-staging -f state="$STATE" \
+            -f description="$DESC" -f target_url="$RUN_URL" > /dev/null
+          echo "hotfix-on-staging: ${STATE} on ${SHA} — ${DESC}"
